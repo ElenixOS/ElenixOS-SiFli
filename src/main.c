@@ -131,7 +131,6 @@ static void lv_port_indev_init(void)
     lv_group_set_default(g);
     lv_indev_set_group(indev_encoder, g);
 }
-#define BUBBLE_DEMO
 #ifdef BUBBLE_DEMO
 #include "bubble_demo.h"
 
