@@ -68,6 +68,10 @@ A standalone LVGL bubble-grid demo that skips ElenixOS initialization. 20 colorf
 
 Disabled by default. Enable by adding `-DBUBBLE_DEMO` to the build defines or uncomment `#define BUBBLE_DEMO` in `src/main.c`.
 
+## Open Source License
+
+This software is released under the Apache License 2.0 open-source license. This license allows individuals and organizations to freely use, modify, and distribute this software and its derivatives for commercial purposes, but requires retaining the original copyright notice, license text, and related statements. The software is provided "as is" without any form of warranty.
+
 ## Dependencies
 
 - **RT-Thread** — RTOS (via SiFli SDK)
