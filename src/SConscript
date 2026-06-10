@@ -1,0 +1,19 @@
+import os
+from building import *
+
+cwd = GetCurrentDir()
+src = []
+CPPPATH = []
+
+src = Glob('*.c')
+CPPPATH += [cwd]
+CPPPATH += [os.path.join(cwd, 'inc')]
+
+src += Glob('devices/*.c')
+CPPPATH += [os.path.join(cwd, 'devices')]
+
+src += Glob('port/*.c')
+CPPPATH += [os.path.join(cwd, 'port')]
+
+group = DefineGroup('App', src, depend=['PKG_USING_LITTLEVGL2RTT'], CPPPATH=CPPPATH)
+Return('group')

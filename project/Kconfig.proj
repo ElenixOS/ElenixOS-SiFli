@@ -1,0 +1,24 @@
+config CUSTOM_MEM_MAP
+    bool
+	select custom_mem_map
+	default y if !SOC_SIMULATOR
+
+menu "Image Cache Configuration"
+
+config IMAGE_CACHE_IN_PSRAM_SIZE
+	int "image cache in psram size (bytes)"
+	depends on BSP_USING_PSRAM
+	default 2100000
+
+config IMAGE_CACHE_IN_PSRAM_SIZE
+	int
+	depends on !BSP_USING_PSRAM
+	default 0
+
+config IMAGE_CACHE_IN_SRAM_SIZE
+	int "image cache in sram size (bytes)"
+	default 200000
+
+endmenu
+
+rsource "../src/Kconfig"

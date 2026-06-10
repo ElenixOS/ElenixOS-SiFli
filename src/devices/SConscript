@@ -1,0 +1,7 @@
+from building import *
+
+src = Glob('*.c')
+CPPPATH = [GetCurrentDir()]
+
+group = DefineGroup('Devices', src, depend=['PKG_USING_LITTLEVGL2RTT'], CPPPATH=CPPPATH)
+Return('group')

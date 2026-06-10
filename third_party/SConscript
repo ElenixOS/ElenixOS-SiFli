@@ -1,0 +1,123 @@
+import os
+import sys
+from building import *
+import rtconfig
+
+SIFLI_SDK = os.getenv('SIFLI_SDK')
+cwd = GetCurrentDir()
+src = []
+CPPPATH = []
+
+# Add our source include path so ElenixOS can find mem_mgr.h, etc.
+project_src_inc = os.path.join(cwd, '..', 'src')
+if os.path.isdir(project_src_inc):
+    CPPPATH += [project_src_inc]
+project_src_inc2 = os.path.join(cwd, '..', 'src', 'inc')
+if os.path.isdir(project_src_inc2):
+    CPPPATH += [project_src_inc2]
+
+# Create a bridge include directory so ElenixOS can use #include "lvgl/src/..."
+# by symlinking lvgl -> SDK LVGL root
+if SIFLI_SDK:
+    lvgl_root = os.path.join(SIFLI_SDK, 'external', 'lvgl_v9')
+    if os.path.isdir(lvgl_root):
+        bridge_dir = os.path.join(cwd, '..', 'build', 'lvgl_bridge')
+        lvgl_link = os.path.join(bridge_dir, 'lvgl')
+        if not os.path.exists(lvgl_link):
+            try:
+                os.makedirs(bridge_dir, exist_ok=True)
+                os.symlink(lvgl_root, lvgl_link)
+            except Exception as e:
+                print("Warning: could not create LVGL symlink: {}".format(e))
+        CPPPATH += [bridge_dir]
+
+def collect_sources(base_dir, exts=(".c", ".cpp", ".S", ".s"), exclude_substr=None):
+    files = []
+    for root, dirs, fnames in os.walk(base_dir):
+        for f in fnames:
+            ext = os.path.splitext(f)[1]
+            if ext in exts:
+                rel = os.path.relpath(os.path.join(root, f), cwd)
+                if exclude_substr and exclude_substr in rel:
+                    continue
+                files += Glob(rel)
+    return files
+
+def collect_inc(base_dir):
+    paths = set()
+    for root, dirs, fnames in os.walk(base_dir):
+        for f in fnames:
+            if os.path.splitext(f)[1] in ('.h', '.hpp'):
+                paths.add(os.path.normpath(root))
+    return list(paths)
+
+EOS_ROOT = os.path.join(cwd, 'ElenixOS')
+
+# --- ElenixOS core source (exclude files we provide ourselves) ---
+src += collect_sources(os.path.join(EOS_ROOT, 'src'),
+                       exclude_substr='port/critical/eos_port_critical_rtthread.c')
+# Exclude ElenixOS's own jerry_port.c (we provide our own)
+src = [s for s in src if 'script_engine/jerry_port.c' not in str(s)]
+CPPPATH += collect_inc(os.path.join(EOS_ROOT, 'src'))
+
+# --- ElenixOS resources ---
+src += collect_sources(os.path.join(EOS_ROOT, 'resources/font'))
+CPPPATH += collect_inc(os.path.join(EOS_ROOT, 'resources'))
+
+# --- cJSON (NOT compiled - SDK provides cJSON-1.7.17 via PKG_USING_CJSON) ---
+CPPPATH += [os.path.join(EOS_ROOT, 'third_party/cJSON')]
+
+# --- JerryScript ---
+JS_ROOT = os.path.join(EOS_ROOT, 'third_party/jerryscript')
+js_src = []
+js_src += collect_sources(os.path.join(JS_ROOT, 'jerry-core'))
+js_src += collect_sources(os.path.join(JS_ROOT, 'jerry-ext'))
+js_src += collect_sources(os.path.join(JS_ROOT, 'jerry-port/common'))
+CPPPATH += [os.path.join(JS_ROOT, 'jerry-core/include')]
+CPPPATH += [os.path.join(JS_ROOT, 'jerry-ext/include')]
+# JerryScript source-internal headers (all dirs with .h files)
+CPPPATH += collect_inc(os.path.join(JS_ROOT, 'jerry-core'))
+CPPPATH += collect_inc(os.path.join(JS_ROOT, 'jerry-ext'))
+
+# --- RemixIcon ---
+RI_ROOT = os.path.join(EOS_ROOT, 'third_party/RemixIcon')
+src += collect_sources(RI_ROOT)
+CPPPATH += collect_inc(RI_ROOT)
+
+# Force-include config.h for JerryScript by prepending to global CCFLAGS
+# This is necessary because the SDK's include path resolution doesn't
+# reliably find jerry-core/config.h from jrt.h's #include "config.h"
+JS_CONFIG_H = os.path.join(JS_ROOT, 'jerry-core', 'config.h')
+try:
+    from building import Env
+    if os.path.isfile(JS_CONFIG_H):
+        Env['CCFLAGS'] = '-include ' + JS_CONFIG_H + ' ' + Env.get('CCFLAGS', '')
+except Exception as e:
+    print("Warning: config.h override failed: {}".format(e))
+
+# Build defines matching ElenixOS CMakeLists.txt
+# Use string format (MACRO=VALUE) for SDK compatibility
+CPPDEFINES = [
+    'EOS_FS_TYPE=EOS_FS_RTTHREAD',
+    'EOS_RTOS_TYPE=EOS_RTOS_RTTHREAD',
+    'EOS_MEM_ALLOC_PROVIDER=EOS_MEM_PROVIDER_STDLIB_CLIB',
+    'EOS_COMPILE_MODE=DEBUG',
+    'EOS_USE_VIRTUAL_DISPLAY=1',
+    'LV_FS_DEFAULT_DRIVE_LETTER=90',
+    # JerryScript features required by ElenixOS script_engine_init()
+    'JERRY_VM_HALT=1',
+    'JERRY_MEM_STATS=1',
+    'JERRY_ERROR_MESSAGES=1',
+]
+
+src += js_src
+
+group = DefineGroup(
+    'ElenixOS',
+    src,
+    depend=[],
+    CPPPATH=CPPPATH,
+    CPPDEFINES=CPPDEFINES,
+)
+
+Return('group')
