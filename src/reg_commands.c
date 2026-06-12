@@ -547,3 +547,62 @@ static void app_move(int argc, char **argv)
     eos_app_order_move(argv[1], (size_t)atoi(argv[2]));
 }
 MSH_CMD_EXPORT(app_move, Move specified app to target index);
+
+static void nand_scan(int argc, char **argv)
+{
+    rt_device_t dev = RT_NULL;
+    /* Try common flash device names */
+    const char *names[] = {"flash4", "flash5", "nand0", "nand1", 0};
+    for (int i = 0; names[i]; i++)
+    {
+        dev = rt_device_find(names[i]);
+        if (dev)
+            printf("Found: %s  type=%d  user_data=0x%p\n",
+                   names[i], dev->type, dev->user_data);
+        else
+            printf("Not found: %s\n", names[i]);
+    }
+    dev = rt_device_find("filesyst");
+    if (dev)
+        printf("filesyst: type=%d flags=0x%x user_data=0x%p\n",
+               dev->type, dev->flag, dev->user_data);
+}
+MSH_CMD_EXPORT(nand_scan, List NAND devices and user_data);
+
+#include "drv_flash.h"
+
+static void nand_erase_fs(int argc, char **argv)
+{
+    extern int dfs_unmount(const char *mount_point);
+
+    uint32_t fs_start = 0x68500000UL;
+    dfs_unmount("/");
+    rt_thread_mdelay(200);
+
+    void *h = rt_nand_get_handle(fs_start);
+    if (!h) { printf("Not a NAND address\n"); return; }
+
+    uint32_t blk_size = HAL_NAND_BLOCK_SIZE((FLASH_HandleTypeDef *)h);
+    uint32_t fs_size = 0x00600000UL;
+    uint32_t num_blks = fs_size / blk_size;
+
+    printf("Block size %uKB, total %u blocks\n", blk_size / 1024, num_blks);
+
+    int ok = 0, fail = 0;
+    for (uint32_t i = 0; i < num_blks; i++)
+    {
+        int r = rt_nand_erase_block(fs_start + i * blk_size);
+        if (r == 0) ok++;
+        else { fail++; printf("  block %u @0x%x FAIL (%d)\n", i, fs_start + i * blk_size, r); }
+        if (i % 8 == 0) printf("  %u/%u OK\n", i, num_blks);
+    }
+    printf("Done: %d OK, %d FAIL\n", ok, fail);
+
+    if (fail == 0)
+    {
+        printf("Formatting...\n");
+        extern int dfs_mkfs(const char *type, const char *dev);
+        dfs_mkfs("elm", "filesyst");
+    }
+}
+MSH_CMD_EXPORT(nand_erase_fs, Erase NAND FS blocks via rt_nand_erase_block);

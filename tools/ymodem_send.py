@@ -74,7 +74,7 @@ def build_header_packet(filename: str, filesize: int) -> bytes:
     for b in filename.encode():
         payload[idx] = b
         idx += 1
-    payload[idx + 1] = 0
+    payload[idx] = 0
     for i, b in enumerate(str(filesize).encode()):
         payload[idx + 1 + i] = b
 
@@ -176,25 +176,45 @@ def ymodem_send(ser: serial.Serial, filename: str, filepath: str,
 
     log("Starting data transfer ...")
     for i, pkt in enumerate(packets):
-        ser.write(pkt)
-        wait_char(ser, [ACK], debug=debug)
+        retries = 3
+        while retries > 0:
+            ser.write(pkt)
+            result = wait_char(ser, [ACK, NAK, CA], debug=debug)
+            _receive_buf.clear()
+            if result == ACK:
+                break
+            if result == CA:
+                raise RuntimeError(f"Receiver cancelled (CAN) at block {i+1}")
+            log(f"NAK for block {i+1}, retransmitting... ({retries})")
+            retries -= 1
+        if retries == 0:
+            raise RuntimeError(f"Block {i+1} failed after 3 retries")
+        sent = min((i + 1) * PACKET_128, total_bytes)
         if debug:
-            written = min((i + 1) * PACKET_1024, total_bytes)
-            print(f"  Block {i + 1}/{len(packets)}  {written}/{total_bytes} bytes", end='\r')
+            print(f"  Block {i + 1}/{len(packets)}  {sent}/{total_bytes} bytes", end='\r')
         else:
-            pct = (i + 1) * 100 // len(packets)
+            pct = sent * 100 // total_bytes
             print(f"  Progress: {pct}%", end='\r')
     print()
     log("Sending EOT ...")
     ser.write(bytes([EOT]))
+    _receive_buf.clear()
     log("Waiting for NAK ...")
-    wait_char(ser, [NAK], debug=debug)
+    try:
+        result = wait_char(ser, [NAK, ACK], debug=debug, timeout=10.0)
+        if result == ACK:
+            log("Got ACK (receiver skipped NAK phase)")
+    except TimeoutError:
+        log("No NAK received, sending EOT anyway...")
     log("Sending EOT ...")
     ser.write(bytes([EOT]))
+    _receive_buf.clear()
     log("Waiting for ACK ...")
     wait_char(ser, [ACK], debug=debug)
+    # DON'T clear here — 'C' arrives alongside ACK (\x06\x43)
     log("Waiting for 'C' ...")
     wait_char(ser, [ASCII_C], debug=debug)
+    _receive_buf.clear()
     log("Sending empty packet (end) ...")
     ser.write(build_header_packet('', 0))
     log("Waiting for ACK ...")
@@ -239,14 +259,19 @@ def pick_from_history(history: list) -> str | None:
     if not history:
         return None
 
+    from collections import Counter
+    base_counts = Counter(os.path.basename(fp) for fp in history)
     print("\nRecently sent files:")
     print("  " + "-" * 50)
     for i, fp in enumerate(history):
         basename = os.path.basename(fp)
         dirname = os.path.dirname(fp)
-        display = f"{dirname}/" if len(dirname) < 50 else dirname[:47] + "..."
-        print(f"  [{i}] {basename}")
-        print(f"       {display}")
+        label = basename if base_counts[basename] == 1 else f"{basename}  ← {dirname}"
+        if len(label) > 60:
+            label = label[:57] + "..."
+        size = os.path.getsize(fp) if os.path.isfile(fp) else -1
+        size_str = f"({size/1024:.0f}KB)" if size >= 0 else "(not found)"
+        print(f"  [{i}] {label} {size_str}")
     print("  [-] Browse with file picker...")
     print()
 
