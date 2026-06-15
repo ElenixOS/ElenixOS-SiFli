@@ -86,8 +86,7 @@
                 "max_size": "0x00004000",
                 "tags": ["KVDB_BLE_REGION"]
             },
-            {"offset": "0x00500000", "max_size": "0x00600000", "img": "fs_root", "tags": ["FLASH_PART2", "FS_REGION"]},
-            {"offset": "0x00B00000", "max_size": "0x00100000", "tags": ["FLASH_PART12", "FS_EX"]},
+            {"offset": "0x00500000", "max_size": "0x00900000", "img": "fs_root", "tags": ["FS_REGION"]},
             {
                 "offset": "0x00E00000", "max_size": "0x0007C000", "tags": ["ACPU_CODE_LOAD_REGION1"],
                 "img": "acpu",
@@ -95,7 +94,8 @@
                     "name": "acpu_region1",
                     "address": ["base"]
                 }
-            }
+            },
+            {"offset": "0x00F00000", "max_size": "0x06000000", "tags": ["FS_DATA_REGION"]}
         ]
     },
     {

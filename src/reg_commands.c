@@ -8,6 +8,7 @@
 #include <rtdbg.h>
 #include <ymodem.h>
 #include "board.h"
+#include "bf0_hal.h"
 #include "lvgl.h"
 #include "eos_core.h"
 #include "eos_log.h"
@@ -571,22 +572,22 @@ MSH_CMD_EXPORT(nand_scan, List NAND devices and user_data);
 
 #include "drv_flash.h"
 
-static void nand_erase_fs(int argc, char **argv)
+static void _nand_erase_and_format(uint32_t fs_start, uint32_t fs_size, const char *dev_name, const char *mount_point)
 {
     extern int dfs_unmount(const char *mount_point);
+    extern int dfs_mkfs(const char *type, const char *dev);
 
-    uint32_t fs_start = 0x68500000UL;
-    dfs_unmount("/");
+    dfs_unmount(mount_point);
     rt_thread_mdelay(200);
 
     void *h = rt_nand_get_handle(fs_start);
     if (!h) { printf("Not a NAND address\n"); return; }
 
     uint32_t blk_size = HAL_NAND_BLOCK_SIZE((FLASH_HandleTypeDef *)h);
-    uint32_t fs_size = 0x00600000UL;
     uint32_t num_blks = fs_size / blk_size;
 
-    printf("Block size %uKB, total %u blocks\n", blk_size / 1024, num_blks);
+    printf("Erasing %s: block size %uKB, total %u blocks, range [0x%x, 0x%x]\n",
+           dev_name, blk_size / 1024, num_blks, fs_start, fs_start + fs_size);
 
     int ok = 0, fail = 0;
     for (uint32_t i = 0; i < num_blks; i++)
@@ -600,9 +601,436 @@ static void nand_erase_fs(int argc, char **argv)
 
     if (fail == 0)
     {
-        printf("Formatting...\n");
-        extern int dfs_mkfs(const char *type, const char *dev);
-        dfs_mkfs("elm", "filesyst");
+        printf("Formatting as elm...\n");
+        if (dfs_mkfs("elm", dev_name) == 0)
+            printf("Format OK. Mount: %s -> %s\n", dev_name, mount_point);
+        else
+            printf("Format FAILED\n");
     }
 }
-MSH_CMD_EXPORT(nand_erase_fs, Erase NAND FS blocks via rt_nand_erase_block);
+
+static void nand_erase_fs(int argc, char **argv)
+{
+    _nand_erase_and_format(FS_REGION_START_ADDR, FS_REGION_SIZE, "filesyst", "/");
+}
+MSH_CMD_EXPORT(nand_erase_fs, Erase+format root NAND FS (FAT));
+
+#ifdef FS_DATA_REGION_START_ADDR
+static void nand_erase_data(int argc, char **argv)
+{
+    _nand_erase_and_format(FS_DATA_REGION_START_ADDR, FS_DATA_REGION_SIZE, "fsdata", "/data");
+}
+MSH_CMD_EXPORT(nand_erase_data, Erase+format /data NAND FS (FAT));
+#endif
+
+/* ==================== Flash I/O 诊断命令 ==================== */
+
+static uint32_t _ms(void)
+{
+    return lv_tick_get();
+}
+
+static int _find_test_file(char *out, int maxlen)
+{
+    /* 扫描常见路径, 找到第一个可用文件 */
+    const char *candidates[] = {
+        "/.sys/res/img/flash_light.bin",
+        "/.sys/res/img/settings.bin",
+        "/.sys/res/img/calculator.bin",
+        "/.sys/res/img/logo.bin",
+        "/.sys/res/img/app.bin",
+        NULL
+    };
+    for (int i = 0; candidates[i]; i++) {
+        struct stat st;
+        if (stat(candidates[i], &st) == 0 && S_ISREG(st.st_mode)) {
+            strncpy(out, candidates[i], maxlen - 1);
+            out[maxlen - 1] = '\0';
+            return 0;
+        }
+    }
+    /* 还找不到就搜整个 /.sys/res/img 取第一个 */
+    eos_dir_t d = eos_fs_opendir("/.sys/res/img");
+    if (d) {
+        while (eos_fs_readdir(d, out, maxlen) == 0) {
+            if (out[0] != '.') {
+                char tmp[256];
+                snprintf(tmp, sizeof(tmp), "/.sys/res/img/%s", out);
+                struct stat st;
+                if (stat(tmp, &st) == 0 && S_ISREG(st.st_mode)) {
+                    strncpy(out, tmp, maxlen - 1);
+                    out[maxlen - 1] = '\0';
+                    eos_fs_closedir(d);
+                    return 0;
+                }
+            }
+        }
+        eos_fs_closedir(d);
+    }
+    /* 搜 /.sys/** 递归找一个文件 */
+    d = eos_fs_opendir("/.sys");
+    if (d) {
+        while (eos_fs_readdir(d, out, maxlen) == 0) {
+            if (out[0] != '.') {
+                char sub[256];
+                snprintf(sub, sizeof(sub), "/.sys/%s", out);
+                struct stat st;
+                if (stat(sub, &st) == 0 && S_ISREG(st.st_mode)) {
+                    strncpy(out, sub, maxlen - 1);
+                    out[maxlen - 1] = '\0';
+                    eos_fs_closedir(d);
+                    return 0;
+                }
+            }
+        }
+        eos_fs_closedir(d);
+    }
+    return -1;
+}
+
+void diag(int argc, char **argv)
+{
+    static uint8_t s_buf[4096] __attribute__((aligned(64)));
+    uint8_t *buf = s_buf;
+    static uint8_t s_dst[2048];
+    char name[128];
+    char test_img[256];
+    uint32_t t0, t1;
+
+    /*━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      D0. 系统时钟与延迟精度诊断
+      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━*/
+    printf("\n=== D0. 时钟与延迟诊断 ===\n");
+    uint32_t hclk = HAL_RCC_GetHCLKFreq(CORE_ID_DEFAULT);
+    printf("HCLK=%u Hz\n", hclk);
+    printf("DWT init=%d\n", HAL_DBG_DWT_IsInit());
+
+    uint32_t cyc0 = HAL_DBG_DWT_GetCycles();
+    HAL_Delay_us_(1000);
+    uint32_t cyc1 = HAL_DBG_DWT_GetCycles();
+    printf("HAL_Delay_us_(1000): %u cycles (expect ~%u)\n",
+           cyc1 - cyc0, hclk / 1000 * 1000);
+    printf("  ≈ %u μs\n", hclk > 0 ? (cyc1 - cyc0) * 1000000 / hclk : 0);
+
+    cyc0 = HAL_DBG_DWT_GetCycles();
+    HAL_Delay_us_(20);
+    cyc1 = HAL_DBG_DWT_GetCycles();
+    printf("HAL_Delay_us_(20): %u cycles (expect ~%u)\n",
+           cyc1 - cyc0, hclk / 1000000 * 20);
+    printf("  ≈ %u μs\n", hclk > 0 ? (cyc1 - cyc0) * 1000000 / hclk : 0);
+
+    volatile uint32_t sum = 0;
+    cyc0 = HAL_DBG_DWT_GetCycles();
+    for (int i = 0; i < 100; i++) {
+        memcpy(s_dst, s_buf, 2048);
+        for (int j = 0; j < 2048 / 4; j++) sum += ((uint32_t *)s_dst)[j];
+    }
+    cyc1 = HAL_DBG_DWT_GetCycles();
+    printf("memcpy(2KB)+sum x100: %u cycles (%u μs avg)  sum=%u\n",
+           cyc1 - cyc0, (cyc1 - cyc0) * 1000000 / hclk / 100, sum);
+
+    /* NAND 控制器频率与命令表 (通过 rt_nand_get_handle 访问) */
+    FLASH_HandleTypeDef *hflash = (FLASH_HandleTypeDef *)rt_nand_get_handle(FS_REGION_START_ADDR);
+    if (hflash) {
+        printf("NAND SPI freq: %u Hz\n", hflash->freq);
+        if (hflash->ctable) {
+            printf("NAND flash_mode=%d manuf=0x%02x dev_id=0x%02x\n",
+                   hflash->ctable->flash_mode,
+                   hflash->ctable->manuf_id,
+                   hflash->ctable->dev_id);
+            printf("  PREAD(0x13): data_mode=%d ins_mode=%d\n",
+                   hflash->ctable->cmd_cfg[4].data_mode,
+                   hflash->ctable->cmd_cfg[4].ins_mode);
+            printf("  4READ(0x%02x): data_mode=%d ins_mode=%d dummy=%d\n",
+                   hflash->ctable->cmd_cfg[10].cmd,
+                   hflash->ctable->cmd_cfg[10].data_mode,
+                   hflash->ctable->cmd_cfg[10].ins_mode,
+                   hflash->ctable->cmd_cfg[10].dummy_cycle);
+        }
+    }
+
+    /*━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      0. 文件系统基本信息
+      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━*/
+    printf("\n=== 0. 文件系统基本信息 ===\n");
+    printf("FS region: 0x%x size: %d\n", FS_REGION_START_ADDR, FS_REGION_SIZE);
+
+    printf("\n--- 0a. 各目录完整遍历 (含 dot 文件) ---\n");
+    const char *scan_dirs[] = {"/", "/.sys", "/.sys/res", "/.sys/res/img", "/data", NULL};
+    for (int i = 0; scan_dirs[i]; i++) {
+        int all = 0, hide = 0;
+        eos_dir_t d = eos_fs_opendir(scan_dirs[i]);
+        if (d) {
+            while (eos_fs_readdir(d, name, sizeof(name)) == 0) {
+                all++;
+                if (name[0] == '.') hide++;
+            }
+            eos_fs_closedir(d);
+            printf("  %-20s: %d entries (%d hidden, %d visible)\n",
+                   scan_dirs[i], all, hide, all - hide);
+        } else {
+            printf("  %-20s: FAIL (opendir failed)\n", scan_dirs[i]);
+        }
+    }
+
+    printf("\n--- 0b. 寻找测试文件 ---\n");
+    int has_file = (_find_test_file(test_img, sizeof(test_img)) == 0);
+    if (has_file) {
+        struct stat st;
+        stat(test_img, &st);
+        printf("  found: %s (%ld bytes)\n", test_img, (long)st.st_size);
+    } else {
+        printf("  no image file found, 部分测试将跳过\n");
+    }
+
+    /*━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      1. 裸 NAND 读 (绕过整个 FS 栈, 硬件延迟基线)
+      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━*/
+    printf("\n=== 1. 裸 NAND 读 ===\n");
+
+    int total_size = rt_nand_get_total_size(FS_REGION_START_ADDR);
+    printf("  NAND total size: %d bytes\n", total_size);
+
+    uint32_t nand_id = rt_nand_read_id(FS_REGION_START_ADDR);
+    printf("  NAND ID: 0x%x\n", nand_id);
+
+    /* 1a: 连续地址 bulk read */
+    t0 = _ms();
+    for (int i = 0; i < 100; i++) {
+        rt_nand_read(FS_REGION_START_ADDR, buf, 64);
+    }
+    t1 = _ms();
+    printf("  1a rt_nand_read(64B) x100: %d ms (%d us avg)\n",
+           t1 - t0, ((t1 - t0) * 1000) / 100);
+
+    t0 = _ms();
+    for (int i = 0; i < 100; i++) {
+        rt_nand_read(FS_REGION_START_ADDR, buf, 512);
+    }
+    t1 = _ms();
+    printf("  1b rt_nand_read(512B) x100: %d ms (%d us avg)\n",
+           t1 - t0, ((t1 - t0) * 1000) / 100);
+
+    t0 = _ms();
+    for (int i = 0; i < 100; i++) {
+        rt_nand_read(FS_REGION_START_ADDR, buf, 2048);
+    }
+    t1 = _ms();
+    printf("  1c rt_nand_read(2KB) x100: %d ms (%d us avg)\n",
+           t1 - t0, ((t1 - t0) * 1000) / 100);
+
+    /* 1d: 测试不同位置 (随机地址) */
+    t0 = _ms();
+    for (int i = 0; i < 100; i++) {
+        uint32_t off = (i * 7919) % (1024 * 1024);  /* 素数步长, 覆盖不同位置 */
+        rt_nand_read(FS_REGION_START_ADDR + off, buf, 64);
+    }
+    t1 = _ms();
+    printf("  1d rt_nand_read(64B,随机偏移) x100: %d ms (%d us avg)\n",
+           t1 - t0, ((t1 - t0) * 1000) / 100);
+
+    /* 1e: read page (带 spare 区域) */
+    t0 = _ms();
+    for (int i = 0; i < 100; i++) {
+        rt_nand_read_page(FS_REGION_START_ADDR, buf, 2048, NULL, 0);
+    }
+    t1 = _ms();
+    printf("  1e rt_nand_read_page(2KB) x100: %d ms (%d us avg)\n",
+           t1 - t0, ((t1 - t0) * 1000) / 100);
+
+    /*━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      2. MTD 块设备读 (经 Dhara FTL, 保留 FS 感知)
+      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━*/
+    printf("\n=== 2. MTD 块设备读 (512B 扇区) ===\n");
+
+    const char *mtd_names[] = {"filesyst", "filesystem", "fsdata"};
+    rt_device_t mtd = NULL;
+    for (int i = 0; mtd_names[i]; i++) {
+        mtd = rt_device_find(mtd_names[i]);
+        if (mtd) {
+            printf("  Found MTD: %s\n", mtd_names[i]);
+            break;
+        }
+    }
+
+    if (mtd) {
+        /* 2a: sector 0 (通常是 FAT 引导区) */
+        t0 = _ms();
+        for (int i = 0; i < 100; i++) {
+            rt_device_read(mtd, 0, buf, 1);
+        }
+        t1 = _ms();
+        printf("  2a sector 0 x100: %d ms (%d us avg)\n",
+               t1 - t0, ((t1 - t0) * 1000) / 100);
+
+        /* 2b: sector 1024 (隔一段距离, 映射到不同 NAND 页) */
+        t0 = _ms();
+        for (int i = 0; i < 100; i++) {
+            rt_device_read(mtd, 1024, buf, 1);
+        }
+        t1 = _ms();
+        printf("  2b sector 1024 x100: %d ms (%d us avg)\n",
+               t1 - t0, ((t1 - t0) * 1000) / 100);
+
+        /* 2c: 随机扇区 (评估 FTL 映射查询开销) */
+        t0 = _ms();
+        for (int i = 0; i < 100; i++) {
+            uint32_t sec = (i * 7919) % 4096;
+            rt_device_read(mtd, sec, buf, 1);
+        }
+        t1 = _ms();
+        printf("  2c 随机 sector x100: %d ms (%d us avg)\n",
+               t1 - t0, ((t1 - t0) * 1000) / 100);
+
+        /* 2d: 连续多扇区 (大块读) */
+        t0 = _ms();
+        for (int i = 0; i < 20; i++) {
+            rt_device_read(mtd, i * 8, buf, 1); /* 读 1 扇区, 连续 */
+        }
+        t1 = _ms();
+        printf("  2d 连续 sector (0,8,16...) x20: %d ms (%d us avg)\n",
+               t1 - t0, ((t1 - t0) * 1000) / 20);
+    } else {
+        printf("  MTD device not found (tried: filesyst, filesystem, fsdata)\n");
+    }
+
+    /*━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      3. 目录操作基准 (不依赖文件存在)
+      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━*/
+    printf("\n=== 3. 目录操作基准 ===\n");
+
+    /* 3a: stat 根目录 */
+    t0 = _ms();
+    for (int i = 0; i < 100; i++) {
+        struct stat st;
+        stat("/", &st);
+    }
+    t1 = _ms();
+    printf("  3a stat(\"/\") x100: %d ms (%d us avg)\n",
+           t1 - t0, ((t1 - t0) * 1000) / 100);
+
+    /* 3b: opendir + 遍历根目录所有条目 */
+    t0 = _ms();
+    for (int j = 0; j < 20; j++) {
+        eos_dir_t d = eos_fs_opendir("/");
+        if (d) {
+            while (eos_fs_readdir(d, name, sizeof(name)) == 0);
+            eos_fs_closedir(d);
+        }
+    }
+    t1 = _ms();
+    printf("  3b opendir+遍历+closedir(\"/\") x20: %d ms (%d us avg)\n",
+           t1 - t0, ((t1 - t0) * 1000) / 20);
+
+    /* 3c: stat 各层级目录 */
+    const char *stat_dirs[] = {"/.sys", "/.sys/res", "/.sys/res/img"};
+    for (int i = 0; i < 3; i++) {
+        t0 = _ms();
+        for (int j = 0; j < 50; j++) {
+            struct stat st;
+            stat(stat_dirs[i], &st);
+        }
+        t1 = _ms();
+        printf("  3c stat(\"%s\") x50: %d ms (%d us avg)\n",
+               stat_dirs[i], t1 - t0, ((t1 - t0) * 1000) / 50);
+    }
+
+    /* 3d: opendir+遍历 各层级目录 */
+    for (int i = 0; i < 3; i++) {
+        t0 = _ms();
+        for (int j = 0; j < 20; j++) {
+            eos_dir_t d = eos_fs_opendir(stat_dirs[i]);
+            if (d) {
+                while (eos_fs_readdir(d, name, sizeof(name)) == 0);
+                eos_fs_closedir(d);
+            }
+        }
+        t1 = _ms();
+        printf("  3d opendir+遍历+closedir(\"%s\") x20: %d ms (%d us avg)\n",
+               stat_dirs[i], t1 - t0, ((t1 - t0) * 1000) / 20);
+    }
+
+    /*━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      4. 文件操作 (仅当找到测试文件)
+      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━*/
+    printf("\n=== 4. 文件操作 ===\n");
+    if (has_file) {
+        /* 4a: 完整的 open → close */
+        t0 = _ms();
+        for (int i = 0; i < 10; i++) {
+            int f = open(test_img, O_RDONLY);
+            if (f >= 0) close(f);
+        }
+        t1 = _ms();
+        printf("  4a open+close x10: %d ms total, %d ms avg\n",
+               t1 - t0, (t1 - t0) / 10);
+
+        /* 4b: 已 open 后 read(64B) + lseek */
+        int fd = open(test_img, O_RDONLY);
+        if (fd >= 0) {
+            t0 = _ms();
+            for (int i = 0; i < 100; i++) {
+                lseek(fd, 0, SEEK_SET);
+                read(fd, buf, 64);
+            }
+            t1 = _ms();
+            printf("  4b open后 read(64B)+lseek x100: %d ms (%d us avg)\n",
+                   t1 - t0, ((t1 - t0) * 1000) / 100);
+            close(fd);
+        }
+
+        /* 4c: 完整读文件 */
+        t0 = _ms();
+        for (int i = 0; i < 10; i++) {
+            int f = open(test_img, O_RDONLY);
+            if (f >= 0) {
+                uint32_t sz;
+                eos_fs_size(f, &sz);
+                read(f, buf, sz < 4096 ? sz : 4096);
+                close(f);
+            }
+        }
+        t1 = _ms();
+        printf("  4c open+read全部+close x10: %d ms (%d ms avg)\n",
+               t1 - t0, (t1 - t0) / 10);
+
+        /* 4d: stat 文件 vs 目录 */
+        t0 = _ms();
+        for (int j = 0; j < 50; j++) {
+            struct stat st;
+            stat(test_img, &st);
+        }
+        t1 = _ms();
+        printf("  4d stat(文件) x50: %d ms (%d us avg)\n",
+               t1 - t0, ((t1 - t0) * 1000) / 50);
+
+        /* 4e: 文件名长度影响 */
+        printf("  4e 文件路径: '%s' (%zu 字符)\n",
+               test_img, strlen(test_img));
+    } else {
+        printf("  未找到测试文件, 跳过文件操作测试\n");
+        printf("  可先上传任意 .bin 图片到 /.sys/res/img/ 目录\n");
+    }
+
+    /*━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      5. 信息汇总
+      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━*/
+    printf("\n=== 5. 信息汇总 ===\n");
+    char cwd[128];
+    if (getcwd(cwd, sizeof(cwd))) printf("  CWD: %s\n", cwd);
+
+    printf("  NAND 裸读 64B:    (见 1a)\n");
+    printf("  NAND 裸读 512B:   (见 1b)\n");
+    printf("  NAND 裸读 2KB:    (见 1c)\n");
+    printf("  MTD 读 512B:      (见 2a)\n");
+    printf("  stat 根目录:       (见 3a)\n");
+    printf("  opendir 根目录:    (见 3b)\n");
+    if (has_file) {
+        printf("  open+close:        (见 4a)\n");
+        printf("  read(64B)+lseek:   (见 4b)\n");
+    } else {
+        printf("  文件测试:         未找到文件已跳过\n");
+    }
+    printf("\n=== 诊断完成 ===\n");
+}
+MSH_CMD_EXPORT(diag, Flash I/O diagnostic tests);
