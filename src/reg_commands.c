@@ -21,6 +21,7 @@
 #include "eos_fs_port.h"
 #include "script_engine_core.h"
 #include "lv_tiny_ttf.h"
+#include "eos_font.h"
 #include "mem_mgr.h"
 
 #define YMODEM_UART_NAME "uart1"
@@ -536,6 +537,19 @@ static void ttf(int argc, char **argv)
     lv_label_set_text(label, "Hello World!");
 }
 MSH_CMD_EXPORT(ttf, Load TTF font from file);
+
+static void font_reload(int argc, char **argv)
+{
+    const char *path = (argc >= 2) ? argv[1] : NULL;
+    printf("Reloading font%s%s...\n",
+           path ? " from " : "", path ? path : "");
+    lv_font_t *font = eos_font_reload(path);
+    if (font)
+        printf("Font reloaded successfully\n");
+    else
+        printf("Font reload failed!\n");
+}
+MSH_CMD_EXPORT(font_reload, Reload TTF fonts. Usage: font_reload [path/to/font.ttf]);
 
 static void app_move(int argc, char **argv)
 {
