@@ -4,6 +4,36 @@ from building import *
 cwd = GetCurrentDir()
 objs = []
 
+# Find build directory and set up global compiler flags BEFORE the SDK
+# SConscript runs, so that LVGL / SDK targets inherit them.
+build_dir = None
+for name in sorted(os.listdir(cwd), reverse=True):
+    if name.startswith('build_') and os.path.isdir(os.path.join(cwd, name)):
+        path = os.path.join(cwd, name)
+        if os.path.isfile(os.path.join(path, '.config')):
+            build_dir = path
+            break
+
+if build_dir:
+    from building import Env
+    # Force-include rtconfig.h so EOS_RTOS_TYPE etc. are always
+    # defined before port-file #if guards.
+    rtconfig_h = os.path.join(build_dir, 'rtconfig.h')
+    if os.path.isfile(rtconfig_h):
+        Env['CCFLAGS'] = Env.get('CCFLAGS', '') + ' -include ' + rtconfig_h
+
+    # When EOS overrides LVGL malloc, switch LVGL to CUSTOM stdlib so
+    # lv_mem_core_rtthread.c compiles to nothing.
+    config_path = os.path.join(build_dir, '.config')
+    override = False
+    with open(config_path, 'r') as f:
+        for line in f:
+            if line.strip() == 'CONFIG_EOS_OVERRIDE_LVGL_STDLIB_MALLOC_ENABLE=y':
+                override = True
+                break
+    if override:
+        Env['CCFLAGS'] = Env.get('CCFLAGS', '') + ' -DLV_USE_STDLIB_MALLOC=4'
+
 Import('SIFLI_SDK')
 objs.extend(SConscript(os.path.join(SIFLI_SDK, 'SConscript'),
                        variant_dir="sifli_sdk", duplicate=0))

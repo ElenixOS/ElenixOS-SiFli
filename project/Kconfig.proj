@@ -22,3 +22,7 @@ config IMAGE_CACHE_IN_SRAM_SIZE
 endmenu
 
 rsource "../src/Kconfig"
+
+menu "ElenixOS"
+source "../third_party/ElenixOS/src/config/Kconfig"
+endmenu

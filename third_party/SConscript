@@ -95,16 +95,112 @@ try:
 except Exception as e:
     print("Warning: config.h override failed: {}".format(e))
 
-# Build defines matching ElenixOS CMakeLists.txt
-# Use string format (MACRO=VALUE) for SDK compatibility
+def _generate_eos_config_gen(config_path, output_dir):
+    """Parse .config from Kconfig and generate eos_config_gen.h.
+
+    Strips the CONFIG_ prefix from every ElenixOS entry in .config and
+    outputs a corresponding #define with a #ifndef guard, so that
+    rtconfig.h (if force-included first) takes precedence without
+    redefinition warnings.
+
+    Choice-type values are handled inside Kconfig itself via companion
+    int configs with default ... if cascades — no mapping table needed.
+    """
+    if not os.path.isfile(config_path):
+        return
+
+    lines = [
+        '/*',
+        ' * Automatically generated from Kconfig .config — DO NOT EDIT.',
+        ' */',
+        '',
+        '#ifndef EOS_CONFIG_GEN_H',
+        '#define EOS_CONFIG_GEN_H',
+        '',
+    ]
+
+    with open(config_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if '=' not in line:
+                continue
+            key, _, val = line.partition('=')
+            key = key.strip()
+            val = val.strip()
+
+            if not (key.startswith('CONFIG_EOS_') or key.startswith('CONFIG_ELENIX_')):
+                continue
+
+            name = key[7:]   # strip 'CONFIG_'
+
+            if val == 'y':
+                lines.append('#ifndef %s' % name)
+                lines.append('#define %s 1' % name)
+                lines.append('#endif')
+            elif val.startswith('"') and val.endswith('"'):
+                lines.append('#ifndef %s' % name)
+                lines.append('#define %s %s' % (name, val))
+                lines.append('#endif')
+            else:
+                lines.append('#ifndef %s' % name)
+                lines.append('#define %s %s' % (name, val))
+                lines.append('#endif')
+
+    lines += ['', '#endif /* EOS_CONFIG_GEN_H */', '']
+
+    output = os.path.join(output_dir, 'eos_config_gen.h')
+    with open(output, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+
+# Find the build output directory and generate eos_config_gen.h
+def _find_build_dir(base_dir):
+    """Find the build output directory containing .config."""
+    try:
+        out = rtconfig.OUTPUT_DIR
+        path = os.path.join(base_dir, out)
+        if os.path.isfile(os.path.join(path, '.config')):
+            return path
+    except AttributeError:
+        pass
+    for name in sorted(os.listdir(base_dir), reverse=True):
+        if name.startswith('build_') and os.path.isdir(os.path.join(base_dir, name)):
+            path = os.path.join(base_dir, name)
+            if os.path.isfile(os.path.join(path, '.config')):
+                return path
+    return None
+
+def _read_config_val(config_path, key):
+    """Read a config value from .config. Returns None if not found."""
+    if not os.path.isfile(config_path):
+        return None
+    with open(config_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith(key + '='):
+                return line.split('=', 1)[1].strip()
+            if line == '# ' + key + ' is not set':
+                return 'n'
+    return None
+
+build_dir = _find_build_dir(os.path.join(cwd, '..'))
+ccflags = ''
+if build_dir:
+    config_path = os.path.join(build_dir, '.config')
+    _generate_eos_config_gen(config_path, build_dir)
+    CPPPATH += [build_dir]
+    # Compiler flags to pass to DefineGroup — these are also set globally
+    # in project/SConscript for SDK targets, but explicit for robustness.
+    rtconfig_h = os.path.join(build_dir, 'rtconfig.h')
+    if os.path.isfile(rtconfig_h):
+        ccflags += ' -include ' + rtconfig_h
+    if _read_config_val(config_path, 'CONFIG_EOS_OVERRIDE_LVGL_STDLIB_MALLOC_ENABLE') == 'y':
+        ccflags += ' -DLV_USE_STDLIB_MALLOC=4'
+
+# Build defines — keep only non-EOS flags that are not covered
+# by Kconfig (JerryScript features required by ElenixOS script_engine_init)
 CPPDEFINES = [
-    'EOS_FS_TYPE=EOS_FS_RTTHREAD',
-    'EOS_RTOS_TYPE=EOS_RTOS_RTTHREAD',
-    'EOS_MEM_ALLOC_PROVIDER=EOS_MEM_PROVIDER_STDLIB_CLIB',
-    'EOS_COMPILE_MODE=DEBUG',
-    'EOS_USE_VIRTUAL_DISPLAY=1',
-    'LV_FS_DEFAULT_DRIVE_LETTER=90',
-    # JerryScript features required by ElenixOS script_engine_init()
     'JERRY_VM_HALT=1',
     'JERRY_MEM_STATS=1',
     'JERRY_ERROR_MESSAGES=1',
@@ -118,6 +214,7 @@ group = DefineGroup(
     depend=[],
     CPPPATH=CPPPATH,
     CPPDEFINES=CPPDEFINES,
+    CCFLAGS=ccflags,
 )
 
 Return('group')
